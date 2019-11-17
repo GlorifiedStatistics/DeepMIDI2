@@ -1,36 +1,81 @@
 from Constants import *
-from PythonUtils import *
 from mido import Message
 import MidiIO
 import pickle
+import numpy as np
 
 
-def encode_notes(note_data, ticks):
+def encode_notes(note_data, ticks, wait_bits=None):
     """
-    Encode the given note data into data the network can use. Time is split into 1/ticks seconds for each tick. Each
-        tick contains what notes should be held on during that tick. Notes are held between ticks if the next tick
-        contains that note as well.
-    :param note_data: the note date
+    Encode the given note data into data the network can use. The list of note data (detailing on and off times for
+        singular notes) is converted into a single list of 1's and 0's (and occasionally -1's).
+        Within each tick, we have:
+            [1/0/-1, 0, 0, ..., 1, 0, 1, ..., 0]
+            |     |                           |
+             type            notes
+        Where "type" is:
+            1 - if the list of notes is turned on
+            0 - if the list of notes is turned off
+            -1 - if nothing happens this tick (IE: the following list of notes is irrelevant)
+        And "notes" is:
+            a list of 88 bits with "1" indicating the note at that index is changed, and "0" meaning it isn't
+    :param note_data: the note data
     :param ticks: the number of ticks per second
+    :param wait_bits: the number of bits to use to for wait times. If the network needs to wait longer than this time,
+        a list of all 0's for the notes will be added repeatedly.
+        If None: use 'ticks' bits
     :return: encoded note data
     """
-    ret = []
-    curr = []  # The current list of held notes
+    if wait_bits is None:
+        wait_bits = ticks
+    inc = 1.0 / ticks
 
+    # Change time to be exact instead of incremental
+    total_time = 0
     for n in note_data:
-        # Stay in the current position until the next note change
-        for i in range(max(1, int(n.time / (1.0 / ticks)))):
-            ret.append([c for c in curr])
+        total_time += n.time
+        n.time = total_time
 
-        # Update the curr
-        if n.type == "note_on":
-            if n.note not in curr:
-                curr.append(n.note)
-        else:
-            if n.note in curr:
-                curr.remove(n.note)
+    # Divide by total_time and round to get tick index
+    data = []
+    for n in note_data:
+        n.time = round(n.time / inc)
+        data.append([int(n.type == 'note_on'), n.note, n.time])
 
-    return ret
+    # Group notes happening at the same time together
+    messages = []
+    i = 0
+    t = 0  # Keep track of current time
+    while i < len(data):
+        r = [data[i][1] * (1 if data[i][0] == 1 else -1), data[i][2] - t]
+        t = data[i][2]
+        while i < len(data) - 1 and data[i + 1][2] == t:
+            i += 1
+            r = [data[i][1] * (1 if data[i][0] == 1 else -1), ] + r
+        messages.append(r)
+        i += 1
+
+    ret = []
+    for m in messages:
+        a = np.zeros([NUM_NOTES + wait_bits, ])  # The zeros
+        t = min(m[-1], wait_bits)  # The wait time
+        m[-1] -= t
+        a[NUM_NOTES:NUM_NOTES + t - 1] = 1  # Set the wait time bit to 1
+
+        # Add all the notes
+        for note in m[:-1]:
+            a[abs(note) - MIDI_NOTE_OFFSET] = 1 if note > 0 else -1
+        ret.append(a)
+
+        # Add all the filler space
+        while m[-1] > 0:
+            a = np.zeros([NUM_NOTES + wait_bits, ])  # The zeros
+            t = min(m[-1], wait_bits)  # The wait time
+            m[-1] -= t
+            a[NUM_NOTES + t - 1] = 1  # Set the wait time bit to 1
+            ret.append(a)
+
+    return np.array(ret)
 
 
 def decode_notes(encoded_notes, ticks):
@@ -41,32 +86,23 @@ def decode_notes(encoded_notes, ticks):
     :return: a list of mido messages
     """
     ret = []
-    curr = []  # The currently pressed notes
-    t = 0  # The number of ticks since last update
+    add_time = 0
+    for row in encoded_notes:
+        on_notes = np.where(row[:NUM_NOTES] > 0.5)[0]
+        off_notes = np.where(row[:NUM_NOTES] < -0.5)[0]
+        total_time = len(np.where(row[NUM_NOTES:] > 0.5)[0])
+        time = total_time + 1 + add_time if total_time > 0 else add_time + 1
+        for n in on_notes:
+            ret.append(Message('note_on', note=n + MIDI_NOTE_OFFSET, time=time / float(ticks) if time > 0 else 0))
+            time = 0
+            add_time = 0
+        for n in off_notes:
+            ret.append(Message('note_off', note=n + MIDI_NOTE_OFFSET, time=time / float(ticks) if time > 0 else 0))
+            time = 0
+            add_time = 0
+        if len(on_notes) == 0 and len(off_notes) == 0:
+            add_time += total_time + 1
 
-    for en in encoded_notes:
-        # Increment time first
-        t += 1
-
-        # Do nothing if the lists do not change
-        if cmp_list(en, curr):
-            continue
-
-        # Find the differences in each list. Those in en but not in curr should now be turned on. Those in curr but
-        #   not in en should be turned off.
-        on, off = diff_list(en, curr), diff_list(curr, en)
-        for o in on:
-            ret.append(Message('note_on', note=o, time=t / float(ticks)))
-            curr.append(o)
-            t = 0
-        for o in off:
-            ret.append(Message('note_off', note=o, time=t / float(ticks)))
-            curr.remove(o)
-            t = 0
-    if len(curr) > 0:
-        ret.append(Message('note_off', note=curr[0], time=(t + 1) / float(ticks)))
-    for n in curr[1:]:
-        ret.append(Message('note_off', note=n, time=0))
     return ret
 
 
@@ -74,12 +110,15 @@ def get_autoencoder_data(path, ticks, num_secs, sliding_window_inc):
     """
     Does get_autoencoder_data for all data in dir (all midi files)
     """
-    total_data = []
+    total_data = None
     for file in os.listdir(path):
         if file[-4:] == '.mid':
-            total_data += _get_singular_autoencoder_data(os.path.join(path, file), ticks, num_secs, sliding_window_inc)
+            add = _get_singular_autoencoder_data(os.path.join(path, file), ticks, num_secs, sliding_window_inc)
+            if total_data is None:
+                total_data = add
+            total_data = np.append(total_data, add, axis=0)
 
-    return total_data
+    return np.array(total_data)
 
 
 def _get_singular_autoencoder_data(file, ticks, num_secs, sliding_window_inc):
@@ -95,43 +134,17 @@ def _get_singular_autoencoder_data(file, ticks, num_secs, sliding_window_inc):
         raise ValueError("Sliding_window_inc must be >= 1, instead is: %d" % sliding_window_inc)
 
     ret = []
-    data = encode_notes(MidiIO.get_note_data(file), ticks)
+    data = encode_notes(MidiIO.read_midi(file), ticks)
 
     curr_idx = 0
     v = int(ticks * num_secs)
     while curr_idx < len(data) - v:
-        ret.append(compress_data(data[curr_idx:curr_idx + v]))
+        ret.append(data[curr_idx:curr_idx + v])
         curr_idx += sliding_window_inc if sliding_window_inc is not None else v
 
     # Also do the last one just cause
-    ret.append(compress_data(data[-v:]))
-
-    return ret
-
-
-def compress_data(data):
-    """
-    Takes the data (a list of lists of notes that are currently on) and converts into a 1D array of 1's and 0's.
-    """
-    ret = [0 for i in range(len(data) * 88)]
-    for i in range(len(data)):
-        for n in data[i]:
-            ret[i * 88 + n - MIDI_NOTE_OFFSET] = 1
-    return ret
-
-
-def uncompress_data(data):
-    """
-    Takes the compressed data and converts back to data that can go through decode_notes
-    """
-    ret = []
-    for i in range(int(len(data) / 88)):
-        add = []
-        for j in range(88):
-            if data[i * 88 + j] > 0.5:
-                add.append(j + MIDI_NOTE_OFFSET)
-        ret.append(add)
-    return ret
+    ret.append(data[-v:])
+    return np.array(ret)
 
 
 def load_midi_data(path, ticks, num_secs, sliding_window_inc):
@@ -159,29 +172,3 @@ def load_midi_data(path, ticks, num_secs, sliding_window_inc):
         return data
     with open(os.path.join(path, h), 'rb') as f:
         return pickle.load(f)
-
-
-def test_midi(ticks, num_secs):
-    from mido import MidiFile, MidiTrack, second2tick
-
-    mid = MidiFile()
-    track = MidiTrack()
-    mid.tracks.append(track)
-
-    for n in decode_notes(encode_notes(MidiIO.get_note_data('mazurka_midis/mazrka10.mid'), ticks), ticks):
-        n.time = int(round(second2tick(n.time, mid.ticks_per_beat, 500000)))
-        track.append(n)
-
-    mid.save("C:/Users/Babynado/Desktop/test.mid")
-
-    mid = MidiFile()
-    track = MidiTrack()
-    mid.tracks.append(track)
-
-    for n in decode_notes(uncompress_data(
-            get_autoencoder_data('./mazurka_midis/mazrka01.mid', ticks, num_secs, None)[0]), ticks):
-        n.time = int(round(second2tick(n.time, mid.ticks_per_beat, 500000)))
-        track.append(n)
-
-    mid.save("C:/Users/Babynado/Desktop/test2.mid")
-

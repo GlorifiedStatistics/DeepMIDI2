@@ -1,19 +1,24 @@
 from mido import MidiFile, Message, MidiTrack, second2tick
 
 
-def write_midi(data, path):
+def write_midi(messages, file):
+    """
+    Writes the list of midi messages to a midi file
+    :param messages: the midi data to write
+    :param file: the string of full path+filename to write to
+    """
     mid = MidiFile()
     track = MidiTrack()
     mid.tracks.append(track)
 
-    for n in data:
-        n.time = int(round(second2tick(n.time, mid.ticks_per_beat, 500000)))
-        track.append(n)
+    for message in messages:
+        message.time = int(round(second2tick(message.time, mid.ticks_per_beat, 500000)))
+        track.append(message)
 
-    mid.save(path)
+    mid.save(file)
 
 
-def get_note_data(path):
+def read_midi(path):
     """
     Reads in the note data from the given midi file. Returns all note_on and note_off messages
     :param path: the path to the midi

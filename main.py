@@ -5,7 +5,7 @@ num_secs = 1
 notes = 88
 sliding_window_inc = 8
 
-curr_model_name = "model_conv"
+curr_model_name = "model_rae"
 
 load = False
 version = 'latest'
@@ -15,9 +15,9 @@ if load:
     print(model.model.summary())
     print("Starting loaded model on iteration:", model.iteration)
 else:
-    model = AutoEncoder(curr_model_name, (ticks, num_secs, sliding_window_inc))
+    model = RecurrentAutoEncoder(curr_model_name, (ticks, num_secs, sliding_window_inc))
     model.build_model()
     print(model.model.summary())
 
-model.train_model(2000, batch_size=256)
+model.train_model(2000, batch_size=512, epochs=4)
 

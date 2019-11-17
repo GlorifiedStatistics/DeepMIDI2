@@ -1,4 +1,4 @@
-from keras.layers import Input, Dense, Dropout, BatchNormalization, Conv2D, UpSampling2D, MaxPooling2D
+from keras.layers import Input, Dense, Dropout, BatchNormalization, LSTM, RepeatVector, TimeDistributed
 from keras.models import Model
 import keras.models
 from Constants import *
@@ -8,7 +8,7 @@ import pickle
 import MidiData
 import MidiIO
 import time
-
+import keras.backend as K
 
 def load_model(model_name, version='latest', sliding_window_inc=None, new_build=False):
     """
@@ -58,8 +58,8 @@ def load_model(model_name, version='latest', sliding_window_inc=None, new_build=
         loaded = keras.models.load_model(os.path.join(m_dir, str(version) + '.h5'))
 
     # Make the new model
-    if model_type == 'ae':
-        model = AutoEncoder(model_name, (ticks, num_secs, sliding_window_inc))
+    if model_type == 'rae':
+        model = RecurrentAutoEncoder(model_name, (ticks, num_secs, sliding_window_inc))
     else:
         raise ValueError("Unknown model type loaded: %s" % model_type)
 
@@ -109,9 +109,12 @@ class AutoEncoder:
         self.last_save_time = time.time()
         self.save_secs = 3600
 
+        self.dump_midi()
+
+    def dump_midi(self, name='ae'):
         # Write the midi meta data for future loading
         with open(os.path.join(self.model_path, MIDI_META_FILE_NAME), 'wb') as f:
-            pickle.dump(('ae', self.ticks, self.num_secs, self.sliding_window_inc), f)
+            pickle.dump((name, self.ticks, self.num_secs, self.sliding_window_inc), f)
 
     def build_model(self):
         in_act = 'relu'
@@ -151,7 +154,7 @@ class AutoEncoder:
         self.model.compile(optimizer=opt, loss=loss)
 
     def train_model(self, num_iters=1000, test_size=0.1, epochs=20, batch_size=512, save_func=None,
-                    midi_save_func=None, save_latest_inc=None):
+                    midi_save_func=None):
         """
         Trains the model for the given number of iterations
         :param num_iters: the number of iterations to train for
@@ -164,8 +167,6 @@ class AutoEncoder:
         :param midi_save_func: a function that takes an integer input (the iteration) and returns True if this is an
             iteration where the output midis of the network should be saved (assuming checkpoint_midis is True)
             - if None, uses the default midi save function
-        :param save_latest_inc: if an integer, the number of iterations to wait before saving to a file named 'latest'
-            This file is constantly overwritten
         """
         if save_func is None:
             save_func = self._save_func
@@ -194,26 +195,26 @@ class AutoEncoder:
         if self.checkpoint_midis and midi_save_func(self.iteration):
             self._save_midis("t_%d.mid" % self.iteration, "v_%d.mid" % self.iteration, x_train_0, x_val_0)
 
-        if time.time() - self.last_save_time > self.save_secs:
+        if time.time() - self.last_save_time > self.save_secs or "latest.h5" not in os.listdir(self.model_path):
             self.model.save(os.path.join(self.model_path, "latest.h5"))
-            self._save_midis("t_l.h5", "v_l.h5", x_train_0, x_val_0)
+            self._save_midis("t_l.mid", "v_l.mid", x_train_0, x_val_0)
 
     def _save_midis(self, t_name, v_name, x_train_0, x_val_0):
-        p_train = self.model.predict(np.array([x_train_0, ])).flatten()
-        MidiIO.write_midi(MidiData.decode_notes(MidiData.uncompress_data(p_train), self.ticks),
+        p_train = self.model.predict(np.array([x_train_0, ]))[0]
+        MidiIO.write_midi(MidiData.decode_notes(p_train, self.ticks),
                           os.path.join(self.midi_train_path, t_name))
-        p_val = self.model.predict(np.array([x_val_0, ])).flatten()
-        MidiIO.write_midi(MidiData.decode_notes(MidiData.uncompress_data(p_val), self.ticks),
+        p_val = self.model.predict(np.array([x_val_0, ]))[0]
+        MidiIO.write_midi(MidiData.decode_notes(p_val, self.ticks),
                           os.path.join(self.midi_val_path, v_name))
         self._make_gt(x_train_0, x_val_0)
 
     def _make_gt(self, x_train_0, x_val_0):
         if "tgt.mid" not in os.listdir(self.midi_train_path):
-            MidiIO.write_midi(MidiData.decode_notes(MidiData.uncompress_data(x_train_0.flatten()), self.ticks),
+            MidiIO.write_midi(MidiData.decode_notes(x_train_0, self.ticks),
                               os.path.join(self.midi_train_path, "tgt.mid"))
         if "vgt.mid" not in os.listdir(self.midi_val_path):
-            MidiIO.write_midi(MidiData.decode_notes(MidiData.uncompress_data(x_val_0.flatten()), self.ticks),
-                              os.path.join(self.midi_val_path, "tgt.mid"))
+            MidiIO.write_midi(MidiData.decode_notes(x_val_0, self.ticks),
+                              os.path.join(self.midi_val_path, "vgt.mid"))
 
     @staticmethod
     def _save_func(iteration):
@@ -235,48 +236,56 @@ class AutoEncoder:
             return True
 
 
-class ConvolutionalAutoEncoder(AutoEncoder):
-    def __init__(self, curr_model_name, midi_meta_data, checkpoint_midis=True):
-        super().__init__(curr_model_name, midi_meta_data, checkpoint_midis=checkpoint_midis)
-        d = []
-        for a in self.data:
-            d.append(np.reshape(a, [-1, 88, 1]))
-        self.data = np.array(d)
+class RecurrentAutoEncoder(AutoEncoder):
 
-        print(self.data.shape)
+    def dump_midi(self, name='rae'):
+        super().dump_midi(name)
+
+    @staticmethod
+    def custom_loss(y_pred, y_true):
+        return K.mean(K.square(y_pred[:, :, :NUM_NOTES] - y_true[:, :, :NUM_NOTES])) \
+            + K.mean(K.square(K.cumsum(y_pred[:, :, NUM_NOTES:], axis=2) - K.cumsum(y_true[:, :, NUM_NOTES:], axis=2)))
 
     def build_model(self):
         in_act = 'relu'
-        last_act = 'sigmoid'
 
-        input_img = Input(shape=(self.num_secs * self.ticks, NUM_NOTES, 1))
+        # define encoder
+        visible = Input(shape=(self.data.shape[1], self.data.shape[2]))
+        encoder = LSTM(256, activation=in_act)(visible)
+        # define reconstruct decoder
+        decoder1 = RepeatVector(self.data.shape[1])(encoder)
+        decoder1 = LSTM(256, activation=in_act, return_sequences=True)(decoder1)
+        decoder1 = TimeDistributed(Dense(self.data.shape[2]))(decoder1)
+        # tie it together
+        self.model = Model(inputs=visible, outputs=[decoder1, ])
+        self.model.compile(optimizer='adam', loss='cross_entropy')  #RecurrentAutoEncoder.custom_loss
 
-        x = Conv2D(64, (7, 7), activation=in_act, padding='same')(input_img)
-        x = MaxPooling2D((2, 2), padding='same')(x)
-        x = Conv2D(32, (3, 3), activation=in_act, padding='same')(x)
-        x = MaxPooling2D((2, 2), padding='same')(x)
-        x = Conv2D(32, (3, 3), activation=in_act, padding='same')(x)
-        x = MaxPooling2D((2, 2), padding='same')(x)
-        x = Conv2D(8, (3, 3), activation=in_act, padding='same')(x)
-        x = MaxPooling2D((2, 1), padding='same')(x)
-        x = Conv2D(4, (3, 3), activation=in_act, padding='same')(x)
-        encoded = MaxPooling2D((2, 1), padding='same')(x)
+    def train_model(self, num_iters=1000, test_size=0.1, epochs=20, batch_size=512, save_func=None,
+                    midi_save_func=None):
+        """
+        Trains the model for the given number of iterations
+        :param num_iters: the number of iterations to train for
+        :param test_size: what percent of the dataset to use for validation purposes
+        :param epochs: the number of epochs to train for each iteration
+        :param batch_size: batch size
+        :param save_func: a function that takes an integer input (the iteration) and returns True if this is an
+            iteration time step where the network should be saved
+            - if None, uses the default save function
+        :param midi_save_func: a function that takes an integer input (the iteration) and returns True if this is an
+            iteration where the output midis of the network should be saved (assuming checkpoint_midis is True)
+            - if None, uses the default midi save function
+        """
+        if save_func is None:
+            save_func = self._save_func
+        if midi_save_func is None:
+            midi_save_func = self._midi_save_func
 
-        # at this point the representation is (4, 4, 8) i.e. 128-dimensional
+        x_train, x_val = tts(np.array(self.data), test_size=test_size, random_state=RANDOM_STATE)
+        for i in range(num_iters):
+            self.iteration += 1
+            self.model.fit(x_train, x_train, epochs=epochs, batch_size=batch_size, shuffle=True,
+                           validation_data=(x_val, x_val))
+            self._save(save_func, x_train[0], x_val[0], midi_save_func)
 
-        x = Conv2D(4, (3, 3), activation=in_act, padding='same')(encoded)
-        x = UpSampling2D((2, 1))(x)
-        x = Conv2D(8, (3, 3), activation=in_act, padding='same')(x)
-        x = UpSampling2D((2, 1))(x)
-        x = Conv2D(8, (3, 3), activation=in_act, padding='same')(x)
-        x = UpSampling2D((2, 2))(x)
-        x = Conv2D(32, (3, 3), activation=in_act, padding='same')(x)
-        x = UpSampling2D((2, 2))(x)
-        x = Conv2D(64, (7, 7), activation=in_act, padding='same')(x)
-        x = UpSampling2D((2, 2))(x)
-        decoded = Conv2D(1, (3, 3), activation=last_act, padding='same')(x)
-
-        self.encoded = encoded
-        self.decoded = decoded
-        self.model = Model(input_img, decoded)
-        self.model.compile(optimizer='nadam', loss='binary_crossentropy')
+        # A final save
+        self._save(lambda x: True, x_train[0], x_val[0], lambda x: True)
