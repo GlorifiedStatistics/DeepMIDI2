@@ -33,6 +33,15 @@ def list_to_string(l):
     return ret
 
 
+def dict_to_list(d):
+    """
+    Converts the given dictionary to a list (removes key info). All sub-dicts will become sub-lists.
+    :param d: the dictionary to convert into a list
+    :return: the given dictionary as a list
+    """
+    pass
+
+
 def linearize_list(l):
     """
     Converts l to be a list containing no sub-lists.
@@ -191,6 +200,31 @@ def diff_dict(d1, d2, ordered=False, typeless_lists=False, remove_used=True, com
                                                     comparators):
             ret[key] = d1[key]
 
+    return ret
+
+
+def add_dicts(d1, d2, behavior=None):
+    """
+    Combines the two dictionaries together. If they have any elements that share the same key, the behavior is
+        defined by 'behavior' which can take the values:
+        - 'first' : keep the value from d1, ignore d2
+        - 'second' : keep the value from d2, ignore d1
+        - 'add' : attempt to add the two values together using the default __add__ implementation
+        - None: if behavior is left as None, an error is thrown upon conflicting keys
+    :param behavior: how to deal with elements that share the same key
+    """
+    ret = {}
+    for key, value in d1.items():
+        ret[key] = value
+    for key, value in d2.items():
+        if key in ret.keys():
+            if behavior is None:
+                raise ValueError("Conflicting keys between the two dictionaries on key '%s'" % key)
+            elif behavior == 'first':
+                continue
+            elif behavior == 'add':
+                ret[key] += value
+        ret[key] = value
     return ret
 
 
